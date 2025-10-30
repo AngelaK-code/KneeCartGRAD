@@ -1,0 +1,254 @@
+import copy
+import hashlib
+import os
+import warnings
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from data_process_new import prepare_testdataset, few_shot
+from metric_new import acc_, f1_score_, precision_, recall_,auc_
+from model_2d import MergeModel  # 导入你的自定义PyTorch模型
+
+warnings.filterwarnings("ignore")
+
+# 设置随机种子以保持结果的一致性
+torch.manual_seed(42)
+
+# num_batch = 8 #class3_crop
+# num_batch = 24 #whole_class2
+num_batch = 20 #crop_class2
+
+num_epochs = 30
+update_test_step = 2
+learning_rate_inner = 0.006
+
+# 图像的长、宽、通道数
+num_classes = 4  # 类别数量
+img_height = 256
+img_width = 256
+channels = 3
+# num_shot =  15 # 支持集样本数crop_class2
+# num_query = 45  # 查询集样本数crop_class2
+num_shot = 5 # 支持集样本数whole_class2
+num_query = 6  # 查询集样本数whole_class2
+# num_shot =  8 # 支持集样本数 class3_crop
+# num_query = 20  # 查询集样本数class3_crop
+
+test_path1 = './DATA_new/test'
+excel_path = './knee_test.xlsx'
+test_images1, labels = prepare_testdataset(test_path1, excel_path, img_height, img_width)
+
+def test_step(model, inner_optimizer, support_set_images_T1, support_set_images_T2, query_set_images_T1, query_set_images_T2,
+              support_labels,
+              query_labels, batch):
+    train_loss = []
+    train_precision = []
+    train_acc = []
+    train_auc = []
+    train_recall = []
+    train_f1 = []
+    train_sensitivity = []
+    train_specificity = []
+    train_PPV = []
+    train_NPV = []
+    predictions = []
+    labels = []
+    probility = []
+
+    # 备份初始模型参数
+    meta_weights = copy.deepcopy(model.state_dict())
+
+    # meta_weights_hash = hashlib.md5(str(meta_weights).encode()).hexdigest()
+    # print(f"meta_weights 的哈希值: {meta_weights_hash}")
+
+    for index in range(batch):
+        model.load_state_dict(meta_weights)
+        # meta_weights_hash = hashlib.md5(str(meta_weights).encode()).hexdigest()
+        # print(f"meta_weights 的哈希值: {meta_weights_hash}")
+        support_T1_data = torch.tensor(support_set_images_T1[index]).cuda(2)
+        support_T2_data = torch.tensor(support_set_images_T2[index]).cuda(2)
+        query_T1_data = torch.tensor(query_set_images_T1[index]).cuda(2)
+        query_T2_data = torch.tensor(query_set_images_T2[index]).cuda(2)
+        support_la = torch.tensor(support_labels[index]).cuda(2)
+        query_la = torch.tensor(query_labels[index]).cuda(2)
+
+        for test_step in range(update_test_step):
+            support_logits = model(support_T1_data, support_T2_data)
+            support_la = support_la.to(torch.long)
+            # print("support_logits:",support_logits.shape)
+            # print("support_la:",support_la.shape)
+            support_la_one_hot = torch.nn.functional.one_hot(support_la, num_classes=4).float()
+            support_loss = criterion(support_logits, support_la)
+
+            # 反向传播和参数更新
+
+            inner_optimizer.zero_grad()
+            support_loss.backward()
+            inner_optimizer.step()
+
+        # meta_weights1 = model.state_dict()
+        # meta_weights_hash1 = hashlib.md5(str(meta_weights1).encode()).hexdigest()
+        # print(f"meta_weights1 的哈希值: {meta_weights_hash1}")
+
+        query_logits = model(query_T1_data, query_T2_data)
+        query_la = query_la.to(torch.long)
+        query_la_one_hot = torch.nn.functional.one_hot(query_la, num_classes=4).float()
+        query_loss = criterion(query_logits, query_la)
+        query_pred = torch.softmax(query_logits, dim=1)
+
+        # 将 true_labels 转换为独热编码形式
+        # num_classes = 2  # 根据您的类别总数设置
+        y_true_one_hot = torch.nn.functional.one_hot(query_la.cpu(), num_classes=num_classes).numpy()
+        # print(y_true_one_hot.shape)
+        # print(query_pred.shape)
+
+        # 计算评估指标
+        # print(f"Labels: {query_la}")
+        # print(f"Preds: {torch.argmax(query_pred, dim=-1)}")
+        epoch_acc = acc_(query_la, torch.argmax(query_pred, dim=-1))
+
+        epoch_auc = auc_(y_true_one_hot, query_pred)
+        query_la_flat = query_la.view(-1).cpu().numpy()  # 转换为一维数组
+        query_pred_flat = torch.argmax(query_pred, dim=-1).view(-1).cpu().numpy()  # 获取预测的类别并展平
+        epoch_precision = precision_(query_la_flat, query_pred_flat)
+        epoch_recall = recall_(query_la_flat, query_pred_flat)
+        epoch_f1 = f1_score_(query_la_flat, query_pred_flat)
+
+        train_loss.append(query_loss.item())
+
+        train_auc.append(epoch_auc)
+
+        train_acc.append(epoch_acc)
+        train_precision.append(epoch_precision)
+        train_recall.append(epoch_recall)
+        train_f1.append(epoch_f1)
+
+        # 存储预测结果
+        predictions.append(torch.argmax(query_pred, dim=-1).cpu().numpy())
+        labels.append(query_la.cpu().numpy())
+        probility.append(query_pred.cpu().detach().numpy())
+
+    # 计算元训练损失
+    train_loss = [torch.tensor(loss) for loss in train_loss]
+    stacked_losses = torch.stack(train_loss)
+    # 计算堆叠后的损失张量的总和
+    meta_batch_loss = torch.sum(stacked_losses)
+    meta_batch_loss.requires_grad = True
+
+    # after_weight = model.state_dict()
+    # after_weights_hash = hashlib.md5(str(after_weight).encode()).hexdigest()
+    # print(f"after_weights 的哈希值: {after_weights_hash}")
+
+    model.load_state_dict(meta_weights)
+
+    every_loss = [loss.numpy() for loss in train_loss]
+    every_acc = [acc.cpu().numpy() for acc in train_acc]
+    every_precision = [precision for precision in train_precision]
+    every_recall = [recall for recall in train_recall]
+    every_f1 = [f1 for f1 in train_f1]
+
+    every_auc = [auc for auc in train_auc]
+
+    # 将预测结果转换为 numpy 数组
+    predictions = np.array(predictions).flatten()
+    # print(predictions.flatten())
+    labels = np.array(labels).flatten()
+    # print(labels.flatten())
+    probility = np.array(probility)
+    probility = np.reshape(probility, (-1, probility.shape[-1]))
+
+    return meta_batch_loss, every_loss, every_acc, every_precision, every_recall, every_f1, predictions, labels, probility, every_auc
+
+
+if not os.path.exists('saved_models'):
+    os.mkdir('saved_models')
+
+best_test_acc = 0.0
+best_test_pred = 0.0
+
+# 存储每个epoch的测试指标
+test_metrics = []
+
+# 创建模型
+Model = MergeModel(num_classes)
+Model = Model.cuda(2)  # 将模型移到GPU
+# 创建损失函数和优化器
+criterion = nn.CrossEntropyLoss()
+inner_optimizer = optim.SGD(Model.parameters(), lr=learning_rate_inner, weight_decay=1e-3, momentum=0.9)
+
+
+for epoch in range(num_epochs):
+    test_average_accuracy = 0.0
+    test_average_precision = 0.0
+    test_average_recall = 0.0
+    test_average_f1 = 0.0
+    test_average_auc = 0.0
+
+    # Model.load_state_dict(torch.load(f'./Train_models_3shot/model_weights_epoch_{epoch + 1}.pth'))
+    Model.load_state_dict(torch.load(f'saved_models/efficientnet_b0G_class5_model_weights_epoch_40.pth'))
+
+
+    test_support_set_images1_epoch, test_support_set_images2_epoch, test_query_set_images1_epoch, test_query_set_images2_epoch, test_support_labels1_epoch, test_query_labels1_epoch = few_shot(
+        dataset_images=test_images1,
+        dataset_labels=labels,
+        num_shot=5,
+        num_query=6,
+        batch=num_batch
+    )
+    _, _, test_acc, test_precision, test_recall, test_f1, test_predictions, test_labels, test_probility,test_auc = test_step(Model,
+                                                                     inner_optimizer,
+                                                                     test_support_set_images1_epoch,
+                                                                     test_support_set_images2_epoch,
+                                                                     test_query_set_images1_epoch,
+                                                                     test_query_set_images2_epoch,
+                                                                     test_support_labels1_epoch,
+                                                                     test_query_labels1_epoch,
+                                                                     num_batch)
+
+
+
+
+    test_average_accuracy += np.mean(test_acc)
+    test_average_precision += np.mean(test_precision)
+    test_average_recall += np.mean(test_recall)
+    test_average_f1 += np.mean(test_f1)
+
+    test_average_auc += np.mean(test_auc)
+
+    print(f"Epoch {epoch + 1}/{num_epochs} - Test Set Evaluation:")
+    print(f"Test Accuracy: {test_average_accuracy:.4f}")
+    print(f"Test Precision: {test_average_precision:.4f}")
+    print(f"Test Recall: {test_average_recall:.4f}")
+    print(f"Test F1 Score: {test_average_f1:.4f}")
+
+    print(f"Test AUC: {test_average_auc:.4f}")
+
+    # 存储测试指标
+    test_metrics.append({
+        "epoch": epoch + 1,
+        "test_accuracy": test_average_accuracy,
+        "test_precision": test_average_precision,
+        "test_recall": test_average_recall,
+        "test_f1_score": test_average_f1,
+
+        "test_auc": test_average_auc,
+
+        "predictions": test_predictions,
+        "labels": test_labels,  # 存储标签信息
+        "probility": test_probility
+    })
+# 计算总的epoch平均指标
+total_test_accuracy = np.mean([metric['test_accuracy'] for metric in test_metrics])
+total_test_precision = np.mean([metric['test_precision'] for metric in test_metrics])
+total_test_recall = np.mean([metric['test_recall'] for metric in test_metrics])
+total_test_f1_score = np.mean([metric['test_f1_score'] for metric in test_metrics])
+total_test_auc = np.mean([metric['test_auc'] for metric in test_metrics])
+
+print("Total Epoch Average Test Metrics:")
+print(f"Total Test Accuracy: {total_test_accuracy:.4f}")
+print(f"Total Test Precision: {total_test_precision:.4f}")
+print(f"Total Test Recall: {total_test_recall:.4f}")
+print(f"Total Test F1 Score: {total_test_f1_score:.4f}")
+print(f"Total Test AUC: {total_test_auc:.4f}")
