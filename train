@@ -1,0 +1,211 @@
+import os
+os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'  # 必须放在所有import语句之前
+import warnings
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from data_process_new import prepare_dataset, few_shot
+from model_2d import MergeModel  # 导入你的自定义PyTorch模型
+from metric_new import acc_, f1_score_, precision_, recall_
+
+warnings.filterwarnings("ignore")
+
+# 设置随机种子以保持结果的一致性
+torch.manual_seed(42)
+
+# num_batch = 24,class3_crop
+# num_batch = 24#whole_calss2
+num_batch = 40#crop_calss2
+
+num_epochs = 300
+inner_train_step = 5
+update_test_step = 3
+learning_rate_inner = 0.001
+learning_rate_outer = 0.001
+
+# 图像的长、宽、通道数
+num_classes = 4  # 类别数量
+img_height = 256
+img_width = 256
+channels = 3
+
+# num_shot = 5  # 支持集样本数,class3_crop
+# num_query = 25  # 查询集样本数,class3_crop
+# num_shot = 5  # 支持集样本数,whole_class2
+# num_query = 15  # 查询集样本数,whole_class2
+num_shot = 5  # 支持集样本数,crop_class2
+num_query = 15  # 查询集样本数,crop_class2
+
+
+data_root = './DATA_new/train'
+excel_path = './knee.xlsx'
+
+patient_features = {}
+patient_labels = {}
+# 准备数据集
+images, labels = prepare_dataset(data_root, excel_path, img_height, img_width)
+
+
+def train_step(model, inner_optimizer, outer_optimizer, support_set_images_T1, support_set_images_T2, query_set_images_T1, query_set_images_T2, support_labels,
+               query_labels, batch):
+    train_loss = []
+    train_precision = []
+    train_acc = []
+    train_recall = []
+    train_f1 = []
+
+    # 备份初始模型参数
+    meta_weights = model.state_dict()
+
+    for index in range(batch):
+        model.load_state_dict(meta_weights)
+ 
+        support_T1_data = torch.tensor(support_set_images_T1[index]).cuda(2)  # Shape: (25, 2, 256, 256)
+        support_T2_data = torch.tensor(support_set_images_T2[index]).cuda(2)
+        query_T1_data = torch.tensor(query_set_images_T1[index]).cuda(2)  # Shape: (75, 2, 256, 256)
+        query_T2_data = torch.tensor(query_set_images_T2[index]).cuda(2)
+        # print(support_labels.shape)
+        support_la = torch.tensor(support_labels[index]).cuda(2)  # Shape: (25, 5)
+        query_la = torch.tensor(query_labels[index]).cuda(2)  # Shape: (75, 5)
+        # print("Support Set Shape:", support_T1_data.shape)
+        # print("query Set Shape:", query_T1_data.shape)
+        # print("Support Labels Shape:", support_la.shape)
+        # print("query Labels Shape:", query_la.shape)
+        for inner_step in range(inner_train_step):
+            support_logits = model(support_T1_data, support_T2_data)  # Forward pass for support set
+            support_la = support_la.to(torch.long)
+            # print("support_logits:",support_logits.shape)
+            # print("support_la:",support_la.shape)
+            support_la_one_hot = torch.nn.functional.one_hot(support_la, num_classes=4).float()
+            # support_logits = support_logits.view(-1, 4)
+            # print("support_la_one_hot:",support_la_one_hot.shape)
+            support_loss = criterion(support_logits, support_la)
+
+            # 反向传播和参数更新
+            inner_optimizer.zero_grad()
+            support_loss.backward()
+            inner_optimizer.step()
+
+        # 对查询集进行预测
+        query_logits = model(query_T1_data, query_T2_data)
+        query_la = query_la.to(torch.long)
+        query_la_one_hot = torch.nn.functional.one_hot(query_la, num_classes=4).float()
+        query_loss = criterion(query_logits, query_la)
+        query_pred = torch.softmax(query_logits, dim=1)
+
+        # 计算评估指标
+        epoch_acc = acc_(query_la, torch.argmax(query_pred, dim=-1))
+        query_la_flat = query_la.view(-1).cpu().numpy()  # 转换为一维数组
+        query_pred_flat = torch.argmax(query_pred, dim=-1).view(-1).cpu().numpy()  # 获取预测的类别并展平
+        epoch_precision = precision_(query_la_flat, query_pred_flat)
+        epoch_recall = recall_(query_la_flat, query_pred_flat)
+        epoch_f1 = f1_score_(query_la_flat, query_pred_flat)
+
+        train_loss.append(query_loss.item())
+        train_acc.append(epoch_acc)
+        train_precision.append(epoch_precision)
+        train_recall.append(epoch_recall)
+        train_f1.append(epoch_f1)
+
+    # 计算元训练损失
+    train_loss = [torch.tensor(loss) for loss in train_loss]
+    stacked_losses = torch.stack(train_loss)
+    # 计算堆叠后的损失张量的总和
+    meta_batch_loss = torch.sum(stacked_losses)
+    meta_batch_loss.requires_grad = True
+
+    model.load_state_dict(meta_weights)
+
+    outer_optimizer.zero_grad()
+    # 梯度下降更新模型参数
+    meta_batch_loss.backward()
+    outer_optimizer.step()
+
+    every_loss = [loss.numpy() for loss in train_loss]
+    every_acc = [acc.cpu().numpy() for acc in train_acc]
+    every_precision = [precision for precision in train_precision]
+    every_recall = [recall for recall in train_recall]
+    every_f1 = [f1 for f1 in train_f1]
+
+    return meta_batch_loss, every_loss, every_acc, every_precision, every_recall, every_f1
+
+# 检查是否存在保存模型的文件夹
+if not os.path.exists('saved_models'):
+    os.mkdir('saved_models')
+
+best_test_acc = 0.0
+best_test_pred = 0.0
+
+# 存储每个epoch的测试指标
+test_metrics = []
+
+# 创建模型
+Model = MergeModel(num_classes)  # 这里的num_classes是标签的数量
+Model = Model.cuda(2)  # 将模型移到GPU
+
+# 创建损失函数和优化器
+criterion = nn.CrossEntropyLoss()  # 用于多标签任务
+inner_optimizer = optim.SGD(Model.parameters(), lr=learning_rate_inner, weight_decay=1e-3, momentum=0.9)
+outer_optimizer = optim.SGD(Model.parameters(), lr=learning_rate_outer, weight_decay=1e-3, momentum=0.9)
+
+
+# 训练和评估循环
+for epoch in range(num_epochs):
+    average_loss = 0.0
+    average_accuracy = 0.0
+    average_precision = 0.0
+    average_recall = 0.0
+    average_f1 = 0.0
+
+    # 训练
+    # support_set_images1_epoch, query_set_images1_epoch, support_labels1_epoch, query_labels1_epoch = few_shot(
+    #     num_classes, num_shot, num_query, dataset_images1, batch=num_batch)
+    support_set_images1_epoch, support_set_images2_epoch, query_set_images1_epoch, query_set_images2_epoch, support_labels1_epoch, query_labels1_epoch = few_shot(
+        dataset_images=images,
+        dataset_labels=labels,
+        num_shot=5,
+        num_query=15,
+        batch=num_batch
+    )
+    # print("Support Labels Shape:", support_labels1_epoch.shape)
+    # 在当前 epoch 中只调用一次 train_step
+    support_set_images1_batch = support_set_images1_epoch
+    query_set_images1_batch = query_set_images1_epoch
+    support_set_images2_batch = support_set_images2_epoch
+    query_set_images2_batch = query_set_images2_epoch
+    support_labels1_batch = support_labels1_epoch
+    query_labels1_batch = query_labels1_epoch
+
+    meta_batch_loss, every_loss, every_acc, every_precision, every_recall, every_f1 = train_step(
+        Model, inner_optimizer, outer_optimizer, support_set_images1_batch, support_set_images2_batch, query_set_images1_batch, query_set_images2_batch, 
+        support_labels1_batch, query_labels1_batch, num_batch)
+
+    # 保存模型权重
+    if (epoch + 1) >= 30 and (epoch + 1) % 20 == 0:
+        torch.save(Model.state_dict(), f'saved_models/efficientnet_b0G_class5_model_weights_epoch_{epoch + 1}.pth')
+
+    # 计算平均指标
+    average_loss += np.mean(every_loss)
+    average_accuracy += np.mean(every_acc)
+    average_precision += np.mean(every_precision)
+    average_recall += np.mean(every_recall)
+    average_f1 += np.mean(every_f1)
+
+    print(f"Epoch {epoch + 1}/{num_epochs}:")
+    print(f"Average Loss: {average_loss:.8f}")
+    print(f"Average Accuracy: {average_accuracy:.4f}")
+    print(f"Average Precision: {average_precision:.4f}")
+    print(f"Average Recall: {average_recall:.4f}")
+    print(f"Average F1 Score: {average_f1:.4f}")
+
+    # 将这些值添加到测试指标列表
+    test_metrics.append({
+        'epoch': epoch + 1,
+        'loss': average_loss,
+        'accuracy': average_accuracy,
+        'precision': average_precision,
+        'recall': average_recall,
+        'f1': average_f1
+    })
