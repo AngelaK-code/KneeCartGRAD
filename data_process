@@ -1,0 +1,151 @@
+import pandas as pd
+import numpy as np
+from PIL import Image
+import os
+import torch
+import torch.nn.functional as F
+from torchvision import transforms
+import re
+import cv2
+
+def augment_image(image, num_augments=2):
+    
+    augmented_images = []
+    h, w, c = image.shape
+    
+    for _ in range(num_augments):
+  
+        aug = image.copy()
+        if np.random.rand() > 0.5:
+            aug = cv2.flip(aug, 1)
+        
+        angle = np.random.uniform(-15, 15)
+        M = cv2.getRotationMatrix2D((w/2, h/2), angle, 1)
+        aug = cv2.warpAffine(aug, M, (w, h))
+        
+        brightness = np.random.uniform(0.8, 1.2)
+        aug = aug * brightness
+        aug = np.clip(aug, 0, 255)  # 假设图像范围是0-255
+        
+        augmented_images.append(aug)
+    return augmented_images
+
+def load_dual_channel_images(patient_folder, img_height=256, img_width=256, transform=None):
+
+    image_files = sorted([f for f in os.listdir(patient_folder) if f.lower().endswith(('.png', '.jpg', '.jpeg'))][:2])
+
+    channels = []
+    for f in image_files:
+        img_path = os.path.join(patient_folder, f)
+        img = Image.open(img_path).convert('L')  # 转为灰度图
+        img = img.resize((img_width, img_height))
+        
+        if transform:
+            img = transform(img)
+        channels.append(np.array(img, dtype=np.float32))
+
+    if len(channels) == 2:
+        dual_channel = np.stack(channels, axis=-1)  # (H, W, 2)
+    else:
+        # 处理缺失图像情况
+        dummy = np.zeros((img_height, img_width), dtype=np.float32)
+        while len(channels) < 2:
+            channels.append(dummy)
+        dual_channel = np.stack(channels, axis=-1)
+
+    three_channel = np.zeros((img_height, img_width, 3), dtype=np.float32)
+    three_channel[:, :, 0] = dual_channel[:, :, 0]  
+    three_channel[:, :, 1] = dual_channel[:, :, 1]  
+    three_channel[:, :, 2] = dual_channel[:, :, 0]  
+    return three_channel / 255.0  # 归一化到[0, 1]
+
+    
+def prepare_dataset(data_root, excel_path, img_height=256, img_width=256):
+  
+    df = pd.read_excel(excel_path, header=1)
+    labels = df.iloc[:, 6].values.astype(int) - 1  
+
+    # 获取排序后的病人文件夹列表
+    patient_folders = sorted(
+        [f for f in os.listdir(data_root) if os.path.isdir(os.path.join(data_root, f))],
+        key=lambda x: int(re.match(r'^\d+', x).group())
+    )
+
+    images = []
+    valid_labels = []
+
+    for idx, folder in enumerate(patient_folders):
+        folder_path = os.path.join(data_root, folder)
+        try:
+            
+            original_img = load_dual_channel_images(folder_path, img_height, img_width)
+            current_label = labels[idx]
+            
+          
+            images.append(original_img)
+            valid_labels.append(current_label)
+            
+            if current_label in [0, 1]:
+                augmented_imgs = augment_image(original_img, num_augments=2)
+                images.extend(augmented_imgs)
+                valid_labels.extend([current_label]*len(augmented_imgs))
+                
+        except Exception as e:
+            print(f"Error loading {folder}: {str(e)}")
+
+    # 转换为numpy数组并调整维度
+    images = np.array(images, dtype=np.float32)
+    valid_labels = np.array(valid_labels)
+    
+    class_counts = np.bincount(valid_labels)
+    print(f"增强后的类别分布: {dict(enumerate(class_counts))}")
+    
+    return images, valid_labels
+
+    
+def few_shot(dataset_images, dataset_labels, num_shot=5, num_query=15, batch=40):
+    """多标签小样本任务生成"""
+    num_patients, H, W, C = dataset_images.shape
+
+    # 初始化容器
+    support_set = np.zeros([batch, 4 * num_shot, H, W, C], dtype=np.float32)
+    query_set = np.zeros([batch, 4 * num_query, H, W, C], dtype=np.float32)
+    support_labs = np.zeros([batch, 4 * num_shot], dtype=int)
+    query_labs = np.zeros([batch, 4 * num_query], dtype=int)
+
+    for b in range(batch):
+        # 为每个任务随机选择类别
+        selected_tasks = np.random.choice(4, 4, replace=False)
+
+        for t, task in enumerate(selected_tasks):
+            # 获取当前任务的有效样本（排除无效标签）
+            valid_indices = np.where(dataset_labels == task)[0]  # 选择单标签类别
+            selected = np.random.choice(valid_indices, num_shot + num_query, replace=True)
+
+            # 分配数据
+            start_s = t * num_shot
+            end_s = (t + 1) * num_shot
+            support_set[b, start_s:end_s] = dataset_images[selected[:num_shot]]
+            support_labs[b, start_s:end_s] = dataset_labels[selected[:num_shot]]
+
+            start_q = t * num_query
+            end_q = (t + 1) * num_query
+            query_set[b, start_q:end_q] = dataset_images[selected[num_shot:]]
+            query_labs[b, start_q:end_q] = dataset_labels[selected[num_shot:]]
+
+    support_set_T1 = np.repeat(support_set[:, :, :, :, 0:1], 3, axis=-1)  
+    support_set_T2 = np.repeat(support_set[:, :, :, :, 1:2], 3, axis=-1)  
+    query_set_T1 = np.repeat(query_set[:, :, :, :, 0:1], 3, axis=-1) 
+    query_set_T2 = np.repeat(query_set[:, :, :, :, 1:2], 3, axis=-1) 
+
+    # 调整维度顺序 (B, N, H, W, C) -> (B, N, C, H, W)
+    support_set_T1 = np.transpose(support_set_T1, (0, 1, 4, 2, 3))
+    support_set_T2 = np.transpose(support_set_T2, (0, 1, 4, 2, 3))
+    query_set_T1 = np.transpose(query_set_T1, (0, 1, 4, 2, 3))
+    query_set_T2 = np.transpose(query_set_T2, (0, 1, 4, 2, 3))
+
+    # 调整维度顺序 (B, N, H, W, C) -> (B, N, C, H, W)
+    # support_set = np.transpose(support_set, (0, 1, 4, 2, 3))
+    # query_set = np.transpose(query_set, (0, 1, 4, 2, 3))
+
+    return support_set_T1, support_set_T2, query_set_T1, query_set_T2, support_labs, query_labs
